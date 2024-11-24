@@ -6,9 +6,11 @@ import {
     IAgentRuntime,
     ModelClass,
     stringToUuid,
+    generateImage,
 } from "@ai16z/eliza";
 import { elizaLogger } from "@ai16z/eliza";
 import { ClientBase } from "./base.ts";
+import { HeuristUrlToBuffer } from "./utils";
 
 const twitterPostTemplate = `{{timeline}}
 
@@ -67,10 +69,6 @@ export class TwitterPostClient {
     runtime: IAgentRuntime;
 
     async start(postImmediately: boolean = false) {
-        if (!this.client.profile) {
-            await this.client.init();
-        }
-
         const generateNewTweetLoop = async () => {
             const lastPost = await this.runtime.cacheManager.get<{
                 timestamp: number;
@@ -115,49 +113,43 @@ export class TwitterPostClient {
 
     private async generateNewTweet() {
         elizaLogger.log("Generating new tweet");
-
         try {
             await this.runtime.ensureUserExists(
                 this.runtime.agentId,
-                this.client.profile.username,
+                this.runtime.getSetting("TWITTER_USERNAME"),
                 this.runtime.character.name,
                 "twitter"
             );
 
-            let homeTimeline: Tweet[] = [];
+            let homeTimeline = [];
 
             const cachedTimeline = await this.client.getCachedTimeline();
-
-            // console.log({ cachedTimeline });
 
             if (cachedTimeline) {
                 homeTimeline = cachedTimeline;
             } else {
-                homeTimeline = await this.client.fetchHomeTimeline(10);
-                await this.client.cacheTimeline(homeTimeline);
+                homeTimeline = await this.client.twitterClient.fetchHomeTimeline(50, homeTimeline);
+                this.client.cacheTimeline(homeTimeline);
             }
+
             const formattedHomeTimeline =
                 `# ${this.runtime.character.name}'s Home Timeline\n\n` +
                 homeTimeline
                     .map((tweet) => {
-                        return `#${tweet.id}\n${tweet.name} (@${tweet.username})${tweet.inReplyToStatusId ? `\nIn reply to: ${tweet.inReplyToStatusId}` : ""}\n${new Date(tweet.timestamp).toDateString()}\n\n${tweet.text}\n---\n`;
+                        return `ID: ${tweet.id}\nFrom: ${tweet.name} (@${tweet.username})${tweet.inReplyToStatusId ? ` In reply to: ${tweet.inReplyToStatusId}` : ""}\nText: ${tweet.text}\n---\n`;
                     })
                     .join("\n");
-
-            const topics = this.runtime.character.topics.join(", ");
 
             const state = await this.runtime.composeState(
                 {
                     userId: this.runtime.agentId,
                     roomId: stringToUuid("twitter_generate_room"),
                     agentId: this.runtime.agentId,
-                    content: {
-                        text: topics,
-                        action: "",
-                    },
+                    content: { text: "", action: "" },
                 },
                 {
-                    twitterUserName: this.client.profile.username,
+                    twitterUserName:
+                        this.runtime.getSetting("TWITTER_USERNAME"),
                     timeline: formattedHomeTimeline,
                 }
             );
@@ -169,14 +161,30 @@ export class TwitterPostClient {
                     twitterPostTemplate,
             });
 
-            elizaLogger.debug("generate post prompt:\n" + context);
-
             const newTweetContent = await generateText({
                 runtime: this.runtime,
                 context,
                 modelClass: ModelClass.SMALL,
             });
 
+            const heuristImageUrl = await generateImage(
+                {
+                    prompt: "magusdevon, purple headwear, blunt bangs, blue eyes, witch hat, big boobs, white robe, at night, dynamic lights, full moon, best quality, masterpiece, ultra detailed, highres, 4k, digital art trending on artstation",
+                    negativePrompt: "worst quality, low quality, nsfw",
+                    numIterations: 25,
+                    guidanceScale: 7,
+                    width: 512,
+                    height: 768,
+                    seed: -1,
+                    modelId: "BrainDance"
+                },
+                this.runtime
+            );
+            
+            let heuristImageBuffer: Buffer | null = null;
+            if (heuristImageUrl.success && heuristImageUrl.data && heuristImageUrl.data.length > 0) {
+                heuristImageBuffer = await HeuristUrlToBuffer(heuristImageUrl.data[0]);
+            }
             // Replace \n with proper line breaks and trim excess spaces
             const formattedTweet = newTweetContent
                 .replaceAll(/\\n/g, "\n")
@@ -194,23 +202,17 @@ export class TwitterPostClient {
 
             try {
                 elizaLogger.log(`Posting new tweet:\n ${content}`);
+                const result = heuristImageBuffer ? await this.client.twitterClient.sendTweetWithMedia(content, [heuristImageBuffer]) : await this.client.requestQueue.add(async () => await this.client.twitterClient.sendTweet(content));
 
-                const result = await this.client.requestQueue.add(
-                    async () =>
-                        await this.client.twitterClient.sendTweet(content)
-                );
                 const body = await result.json();
                 const tweetResult = body.data.create_tweet.tweet_results.result;
 
-                // console.dir({ tweetResult }, { depth: Infinity });
                 const tweet = {
                     id: tweetResult.rest_id,
-                    name: this.client.profile.screenName,
-                    username: this.client.profile.username,
                     text: tweetResult.legacy.full_text,
                     conversationId: tweetResult.legacy.conversation_id_str,
                     createdAt: tweetResult.legacy.created_at,
-                    userId: this.client.profile.id,
+                    userId: tweetResult.legacy.user_id_str,
                     inReplyToStatusId:
                         tweetResult.legacy.in_reply_to_status_id_str,
                     permanentUrl: `https://twitter.com/${this.runtime.getSetting("TWITTER_USERNAME")}/status/${tweetResult.rest_id}`,
@@ -223,7 +225,9 @@ export class TwitterPostClient {
                 } as Tweet;
 
                 await this.runtime.cacheManager.set(
-                    `twitter/${this.client.profile.username}/lastPost`,
+                    "twitter/" +
+                        this.runtime.getSetting("TWITTER_USERNAME") +
+                        "/lastPost",
                     {
                         id: tweet.id,
                         timestamp: Date.now(),
@@ -245,6 +249,8 @@ export class TwitterPostClient {
                     this.runtime.agentId,
                     roomId
                 );
+
+                await this.client.cacheTweet(tweet);
 
                 await this.runtime.messageManager.createMemory({
                     id: stringToUuid(tweet.id + "-" + this.runtime.agentId),
