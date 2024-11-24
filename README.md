@@ -1,4 +1,5 @@
 # Mona
+Update [post.ts](https://github.com/ai16z/eliza/commit/cd412c552e67fde3667217efc23b1bf5cad9ad36) to post tweets with an image.
 
 ![mona banner](https://github.com/user-attachments/assets/2304a350-ad90-4f09-9c3f-d0a73346346b)
 
