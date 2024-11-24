@@ -5,7 +5,7 @@ export const character: Character = {
     name: "Mona",
     plugins: [],
     clients: [Clients.TWITTER],
-    modelProvider: ModelProviderName.HEURIST,
+    modelProvider: ModelProviderName.ANTHROPIC,
     settings: {
         secrets: {},
         voice: {
