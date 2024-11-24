@@ -1,8 +1,6 @@
-# Eliza 🤖
+# Mona
 
-<div align="center">
-  <img src="./docs/static/img/eliza_banner.jpg" alt="Eliza Banner" width="100%" />
-</div>
+![mona banner](https://github.com/user-attachments/assets/2304a350-ad90-4f09-9c3f-d0a73346346b)
 
 <div align="center">
   
