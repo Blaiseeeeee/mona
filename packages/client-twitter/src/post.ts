@@ -1,275 +1,690 @@
-import { Tweet } from "agent-twitter-client";
 import {
-    composeContext,
-    generateText,
-    embeddingZeroVector,
+    Content,
     IAgentRuntime,
-    ModelClass,
+    IImageDescriptionService,
+    Memory,
+    State,
+    UUID,
+    embeddingZeroVector,
+    elizaLogger,
     stringToUuid,
-    generateImage,
 } from "@ai16z/eliza";
-import { elizaLogger } from "@ai16z/eliza";
-import { ClientBase } from "./base.ts";
-import { HeuristUrlToBuffer } from "./utils";
+import {
+    QueryTweetsResponse,
+    Scraper,
+    SearchMode,
+    Tweet,
+} from "agent-twitter-client";
+import { EventEmitter } from "events";
 
-const twitterPostTemplate = `{{timeline}}
-
-# Knowledge
-{{knowledge}}
-
-About {{agentName}} (@{{twitterUserName}}):
-{{bio}}
-{{lore}}
-{{postDirections}}
-
-{{providers}}
-
-{{recentPosts}}
-
-{{characterPostExamples}}
-
-# Task: Generate a post in the voice and style of {{agentName}}, aka @{{twitterUserName}}
-Write a single sentence post that is {{adjective}} about {{topic}} (without mentioning {{topic}} directly), from the perspective of {{agentName}}. Try to write something totally different than previous posts. Do not add commentary or acknowledge this request, just write the post.
-Your response should not contain any questions. Brief, concise statements only. No emojis. Use \\n\\n (double spaces) between statements.`;
-
-const MAX_TWEET_LENGTH = 280;
-
-/**
- * Truncate text to fit within the Twitter character limit, ensuring it ends at a complete sentence.
- */
-function truncateToCompleteSentence(text: string): string {
-    if (text.length <= MAX_TWEET_LENGTH) {
-        return text;
-    }
-
-    // Attempt to truncate at the last period within the limit
-    const truncatedAtPeriod = text.slice(
-        0,
-        text.lastIndexOf(".", MAX_TWEET_LENGTH) + 1
-    );
-    if (truncatedAtPeriod.trim().length > 0) {
-        return truncatedAtPeriod.trim();
-    }
-
-    // If no period is found, truncate to the nearest whitespace
-    const truncatedAtSpace = text.slice(
-        0,
-        text.lastIndexOf(" ", MAX_TWEET_LENGTH)
-    );
-    if (truncatedAtSpace.trim().length > 0) {
-        return truncatedAtSpace.trim() + "...";
-    }
-
-    // Fallback: Hard truncate and add ellipsis
-    return text.slice(0, MAX_TWEET_LENGTH - 3).trim() + "...";
+export function extractAnswer(text: string): string {
+    const startIndex = text.indexOf("Answer: ") + 8;
+    const endIndex = text.indexOf("<|endoftext|>", 11);
+    return text.slice(startIndex, endIndex);
 }
 
-export class TwitterPostClient {
-    client: ClientBase;
-    runtime: IAgentRuntime;
+type TwitterProfile = {
+    id: string;
+    username: string;
+    screenName: string;
+    bio: string;
+    nicknames: string[];
+};
 
-    async start(postImmediately: boolean = false) {
-        const generateNewTweetLoop = async () => {
-            const lastPost = await this.runtime.cacheManager.get<{
-                timestamp: number;
-            }>(
-                "twitter/" +
-                    this.runtime.getSetting("TWITTER_USERNAME") +
-                    "/lastPost"
-            );
+class RequestQueue {
+    private queue: (() => Promise<any>)[] = [];
+    private processing: boolean = false;
 
-            const lastPostTimestamp = lastPost?.timestamp ?? 0;
-            const minMinutes =
-                parseInt(this.runtime.getSetting("POST_INTERVAL_MIN")) || 90;
-            const maxMinutes =
-                parseInt(this.runtime.getSetting("POST_INTERVAL_MAX")) || 180;
-            const randomMinutes =
-                Math.floor(Math.random() * (maxMinutes - minMinutes + 1)) +
-                minMinutes;
-            const delay = randomMinutes * 60 * 1000;
+    async add<T>(request: () => Promise<T>): Promise<T> {
+        return new Promise((resolve, reject) => {
+            this.queue.push(async () => {
+                try {
+                    const result = await request();
+                    resolve(result);
+                } catch (error) {
+                    reject(error);
+                }
+            });
+            this.processQueue();
+        });
+    }
 
-            if (Date.now() > lastPostTimestamp + delay) {
-                await this.generateNewTweet();
+    private async processQueue(): Promise<void> {
+        if (this.processing || this.queue.length === 0) {
+            return;
+        }
+        this.processing = true;
+
+        while (this.queue.length > 0) {
+            const request = this.queue.shift()!;
+            try {
+                await request();
+            } catch (error) {
+                console.error("Error processing request:", error);
+                this.queue.unshift(request);
+                await this.exponentialBackoff(this.queue.length);
             }
-
-            setTimeout(() => {
-                generateNewTweetLoop(); // Set up next iteration
-            }, delay);
-
-            elizaLogger.log(`Next tweet scheduled in ${randomMinutes} minutes`);
-        };
-
-        if (postImmediately) {
-            this.generateNewTweet();
+            await this.randomDelay();
         }
 
-        generateNewTweetLoop();
+        this.processing = false;
     }
 
-    constructor(client: ClientBase, runtime: IAgentRuntime) {
-        this.client = client;
+    private async exponentialBackoff(retryCount: number): Promise<void> {
+        const delay = Math.pow(2, retryCount) * 1000;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+
+    private async randomDelay(): Promise<void> {
+        const delay = Math.floor(Math.random() * 2000) + 1500;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+}
+
+export class ClientBase extends EventEmitter {
+    static _twitterClient: Scraper;
+    twitterClient: Scraper;
+    runtime: IAgentRuntime;
+    directions: string;
+    lastCheckedTweetId: bigint | null = null;
+    imageDescriptionService: IImageDescriptionService;
+    temperature: number = 0.5;
+
+    requestQueue: RequestQueue = new RequestQueue();
+
+    profile: TwitterProfile | null;
+
+    async cacheTweet(tweet: Tweet): Promise<void> {
+        if (!tweet) {
+            console.warn("Tweet is undefined, skipping cache");
+            return;
+        }
+
+        this.runtime.cacheManager.set(`twitter/tweets/${tweet.id}`, tweet);
+    }
+
+    async getCachedTweet(tweetId: string): Promise<Tweet | undefined> {
+        const cached = await this.runtime.cacheManager.get<Tweet>(
+            `twitter/tweets/${tweetId}`
+        );
+
+        return cached;
+    }
+
+    async getTweet(tweetId: string): Promise<Tweet> {
+        const cachedTweet = await this.getCachedTweet(tweetId);
+
+        if (cachedTweet) {
+            return cachedTweet;
+        }
+
+        const tweet = await this.requestQueue.add(() =>
+            this.twitterClient.getTweet(tweetId)
+        );
+
+        await this.cacheTweet(tweet);
+        return tweet;
+    }
+
+    callback: (self: ClientBase) => any = null;
+
+    onReady() {
+        throw new Error(
+            "Not implemented in base class, please call from subclass"
+        );
+    }
+
+    constructor(runtime: IAgentRuntime) {
+        super();
         this.runtime = runtime;
+        if (ClientBase._twitterClient) {
+            this.twitterClient = ClientBase._twitterClient;
+        } else {
+            this.twitterClient = new Scraper();
+            ClientBase._twitterClient = this.twitterClient;
+        }
+
+        this.directions =
+            "- " +
+            this.runtime.character.style.all.join("\n- ") +
+            "- " +
+            this.runtime.character.style.post.join();
     }
 
-    private async generateNewTweet() {
-        elizaLogger.log("Generating new tweet");
+    async init() {
+        //test
+        const username = this.runtime.getSetting("TWITTER_USERNAME");
+
+        if (!username) {
+            throw new Error("Twitter username not configured");
+        }
+        // Check for Twitter cookies
+        if (this.runtime.getSetting("TWITTER_COOKIES")) {
+            const cookiesArray = JSON.parse(
+                this.runtime.getSetting("TWITTER_COOKIES")
+            );
+
+            await this.setCookiesFromArray(cookiesArray);
+        } else {
+            const cachedCookies = await this.getCachedCookies(username);
+            if (cachedCookies) {
+                await this.setCookiesFromArray(cachedCookies);
+            }
+        }
+
+        elizaLogger.log("Waiting for Twitter login");
+        while (true) {
+            if (await this.twitterClient.isLoggedIn()) {
+                const cookies = await this.twitterClient.getCookies();
+                await this.cacheCookies(username, cookies);
+                break;
+            }
+            await this.twitterClient.login(
+                username,
+                this.runtime.getSetting("TWITTER_PASSWORD"),
+                this.runtime.getSetting("TWITTER_EMAIL"),
+                this.runtime.getSetting("TWITTER_2FA_SECRET")
+            );
+
+            elizaLogger.error("Failed to login to Twitter trying again...");
+
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+
+        // Initialize Twitter profile
+        this.profile = await this.fetchProfile(username);
+
+        if (this.profile) {
+            elizaLogger.log("Twitter user ID:", this.profile.id);
+            elizaLogger.log(
+                "Twitter loaded:",
+                JSON.stringify(this.profile, null, 10)
+            );
+            // Store profile info for use in responses
+            this.runtime.character.twitterProfile = {
+                id: this.profile.id,
+                username: this.profile.username,
+                screenName: this.profile.screenName,
+                bio: this.profile.bio,
+                nicknames: this.profile.nicknames,
+            };
+        } else {
+            throw new Error("Failed to load profile");
+        }
+
+        await this.loadLatestCheckedTweetId();
+        await this.populateTimeline();
+    }
+
+    async fetchHomeTimeline(count: number): Promise<Tweet[]> {
+        elizaLogger.debug("fetching home timeline");
+        const homeTimeline = await this.twitterClient.getUserTweets(
+            this.profile.id,
+            count
+        );
+
+        // console.dir(homeTimeline, { depth: Infinity });
+
+        return homeTimeline.tweets;
+        // .filter((t) => t.__typename !== "TweetWithVisibilityResults")
+        // .map((tweet) => {
+        //     // console.log("tweet is", tweet);
+        //     const obj = {
+        //         id: tweet.id,
+        //         name:
+        //             tweet.name ??
+        //             tweet. ?.user_results?.result?.legacy.name,
+        //         username:
+        //             tweet.username ??
+        //             tweet.core?.user_results?.result?.legacy.screen_name,
+        //         text: tweet.text ?? tweet.legacy?.full_text,
+        //         inReplyToStatusId:
+        //             tweet.inReplyToStatusId ??
+        //             tweet.legacy?.in_reply_to_status_id_str,
+        //         createdAt: tweet.createdAt ?? tweet.legacy?.created_at,
+        //         userId: tweet.userId ?? tweet.legacy?.user_id_str,
+        //         conversationId:
+        //             tweet.conversationId ??
+        //             tweet.legacy?.conversation_id_str,
+        //         hashtags: tweet.hashtags ?? tweet.legacy?.entities.hashtags,
+        //         mentions:
+        //             tweet.mentions ?? tweet.legacy?.entities.user_mentions,
+        //         photos:
+        //             tweet.photos ??
+        //             tweet.legacy?.entities.media?.filter(
+        //                 (media) => media.type === "photo"
+        //             ) ??
+        //             [],
+        //         thread: [],
+        //         urls: tweet.urls ?? tweet.legacy?.entities.urls,
+        //         videos:
+        //             tweet.videos ??
+        //             tweet.legacy?.entities.media?.filter(
+        //                 (media) => media.type === "video"
+        //             ) ??
+        //             [],
+        //     };
+        //     // console.log("obj is", obj);
+        //     return obj;
+        // });
+    }
+
+    async fetchSearchTweets(
+        query: string,
+        maxTweets: number,
+        searchMode: SearchMode,
+        cursor?: string
+    ): Promise<QueryTweetsResponse> {
         try {
-            await this.runtime.ensureUserExists(
-                this.runtime.agentId,
-                this.runtime.getSetting("TWITTER_USERNAME"),
-                this.runtime.character.name,
-                "twitter"
+            // Sometimes this fails because we are rate limited. in this case, we just need to return an empty array
+            // if we dont get a response in 5 seconds, something is wrong
+            const timeoutPromise = new Promise((resolve) =>
+                setTimeout(() => resolve({ tweets: [] }), 10000)
             );
 
-            let homeTimeline = [];
-
-            const cachedTimeline = await this.client.getCachedTimeline();
-
-            if (cachedTimeline) {
-                homeTimeline = cachedTimeline;
-            } else {
-                homeTimeline = await this.client.twitterClient.fetchHomeTimeline(50, homeTimeline);
-                this.client.cacheTimeline(homeTimeline);
+            try {
+                const result = await this.requestQueue.add(
+                    async () =>
+                        await Promise.race([
+                            this.twitterClient.fetchSearchTweets(
+                                query,
+                                maxTweets,
+                                searchMode,
+                                cursor
+                            ),
+                            timeoutPromise,
+                        ])
+                );
+                return (result ?? { tweets: [] }) as QueryTweetsResponse;
+            } catch (error) {
+                elizaLogger.error("Error fetching search tweets:", error);
+                return { tweets: [] };
             }
+        } catch (error) {
+            elizaLogger.error("Error fetching search tweets:", error);
+            return { tweets: [] };
+        }
+    }
 
-            const formattedHomeTimeline =
-                `# ${this.runtime.character.name}'s Home Timeline\n\n` +
-                homeTimeline
-                    .map((tweet) => {
-                        return `ID: ${tweet.id}\nFrom: ${tweet.name} (@${tweet.username})${tweet.inReplyToStatusId ? ` In reply to: ${tweet.inReplyToStatusId}` : ""}\nText: ${tweet.text}\n---\n`;
-                    })
-                    .join("\n");
+    private async populateTimeline() {
+        elizaLogger.debug("populating timeline...");
 
-            const state = await this.runtime.composeState(
-                {
-                    userId: this.runtime.agentId,
-                    roomId: stringToUuid("twitter_generate_room"),
-                    agentId: this.runtime.agentId,
-                    content: { text: "", action: "" },
-                },
-                {
-                    twitterUserName:
-                        this.runtime.getSetting("TWITTER_USERNAME"),
-                    timeline: formattedHomeTimeline,
+        const cachedTimeline = await this.getCachedTimeline();
+
+        // Check if the cache file exists
+        if (cachedTimeline) {
+            // Read the cached search results from the file
+
+            // Get the existing memories from the database
+            const existingMemories =
+                await this.runtime.messageManager.getMemoriesByRoomIds({
+                    roomIds: cachedTimeline.map((tweet) =>
+                        stringToUuid(
+                            tweet.conversationId + "-" + this.runtime.agentId
+                        )
+                    ),
+                });
+
+            //TODO: load tweets not in cache?
+
+            // Create a Set to store the IDs of existing memories
+            const existingMemoryIds = new Set(
+                existingMemories.map((memory) => memory.id.toString())
+            );
+
+            // Check if any of the cached tweets exist in the existing memories
+            const someCachedTweetsExist = cachedTimeline.some((tweet) =>
+                existingMemoryIds.has(
+                    stringToUuid(tweet.id + "-" + this.runtime.agentId)
+                )
+            );
+
+            if (someCachedTweetsExist) {
+                // Filter out the cached tweets that already exist in the database
+                const tweetsToSave = cachedTimeline.filter(
+                    (tweet) =>
+                        !existingMemoryIds.has(
+                            stringToUuid(tweet.id + "-" + this.runtime.agentId)
+                        )
+                );
+
+                console.log({
+                    processingTweets: tweetsToSave
+                        .map((tweet) => tweet.id)
+                        .join(","),
+                });
+
+                // Save the missing tweets as memories
+                for (const tweet of tweetsToSave) {
+                    elizaLogger.log("Saving Tweet", tweet.id);
+
+                    const roomId = stringToUuid(
+                        tweet.conversationId + "-" + this.runtime.agentId
+                    );
+
+                    const userId =
+                        tweet.userId === this.profile.id
+                            ? this.runtime.agentId
+                            : stringToUuid(tweet.userId);
+
+                    if (tweet.userId === this.profile.id) {
+                        await this.runtime.ensureConnection(
+                            this.runtime.agentId,
+                            roomId,
+                            this.profile.username,
+                            this.profile.screenName,
+                            "twitter"
+                        );
+                    } else {
+                        await this.runtime.ensureConnection(
+                            userId,
+                            roomId,
+                            tweet.username,
+                            tweet.name,
+                            "twitter"
+                        );
+                    }
+
+                    const content = {
+                        text: tweet.text,
+                        url: tweet.permanentUrl,
+                        source: "twitter",
+                        inReplyTo: tweet.inReplyToStatusId
+                            ? stringToUuid(
+                                  tweet.inReplyToStatusId +
+                                      "-" +
+                                      this.runtime.agentId
+                              )
+                            : undefined,
+                    } as Content;
+
+                    elizaLogger.log("Creating memory for tweet", tweet.id);
+
+                    // check if it already exists
+                    const memory =
+                        await this.runtime.messageManager.getMemoryById(
+                            stringToUuid(tweet.id + "-" + this.runtime.agentId)
+                        );
+
+                    if (memory) {
+                        elizaLogger.log(
+                            "Memory already exists, skipping timeline population"
+                        );
+                        break;
+                    }
+
+                    await this.runtime.messageManager.createMemory({
+                        id: stringToUuid(tweet.id + "-" + this.runtime.agentId),
+                        userId,
+                        content: content,
+                        agentId: this.runtime.agentId,
+                        roomId,
+                        embedding: embeddingZeroVector,
+                        createdAt: tweet.timestamp * 1000,
+                    });
+
+                    await this.cacheTweet(tweet);
                 }
-            );
 
-            const context = composeContext({
-                state,
-                template:
-                    this.runtime.character.templates?.twitterPostTemplate ||
-                    twitterPostTemplate,
-            });
-
-            const newTweetContent = await generateText({
-                runtime: this.runtime,
-                context,
-                modelClass: ModelClass.SMALL,
-            });
-
-            const heuristImageUrl = await generateImage(
-                {
-                    prompt: "magusdevon, purple headwear, blunt bangs, blue eyes, witch hat, big boobs, white robe, at night, dynamic lights, full moon, best quality, masterpiece, ultra detailed, highres, 4k, digital art trending on artstation",
-                    negativePrompt: "worst quality, low quality, nsfw",
-                    numIterations: 25,
-                    guidanceScale: 7,
-                    width: 512,
-                    height: 768,
-                    seed: -1,
-                    modelId: "BrainDance"
-                },
-                this.runtime
-            );
-            
-            let heuristImageBuffer: Buffer | null = null;
-            if (heuristImageUrl.success && heuristImageUrl.data && heuristImageUrl.data.length > 0) {
-                heuristImageBuffer = await HeuristUrlToBuffer(heuristImageUrl.data[0]);
-            }
-            // Replace \n with proper line breaks and trim excess spaces
-            const formattedTweet = newTweetContent
-                .replaceAll(/\\n/g, "\n")
-                .trim();
-
-            // Use the helper function to truncate to complete sentence
-            const content = truncateToCompleteSentence(formattedTweet);
-
-            if (this.runtime.getSetting("TWITTER_DRY_RUN") === "true") {
-                elizaLogger.info(
-                    `Dry run: would have posted tweet: ${content}`
+                elizaLogger.log(
+                    `Populated ${tweetsToSave.length} missing tweets from the cache.`
                 );
                 return;
             }
+        }
 
-            try {
-                elizaLogger.log(`Posting new tweet:\n ${content}`);
-                const result = heuristImageBuffer ? await this.client.twitterClient.sendTweetWithMedia(content, [heuristImageBuffer]) : await this.client.requestQueue.add(async () => await this.client.twitterClient.sendTweet(content));
+        const timeline = await this.fetchHomeTimeline(cachedTimeline ? 10 : 50);
 
-                const body = await result.json();
-                const tweetResult = body.data.create_tweet.tweet_results.result;
+        // Get the most recent 20 mentions and interactions
+        const mentionsAndInteractions = await this.fetchSearchTweets(
+            `@${this.runtime.getSetting("TWITTER_USERNAME")}`,
+            20,
+            SearchMode.Latest
+        );
 
-                const tweet = {
-                    id: tweetResult.rest_id,
-                    text: tweetResult.legacy.full_text,
-                    conversationId: tweetResult.legacy.conversation_id_str,
-                    createdAt: tweetResult.legacy.created_at,
-                    userId: tweetResult.legacy.user_id_str,
-                    inReplyToStatusId:
-                        tweetResult.legacy.in_reply_to_status_id_str,
-                    permanentUrl: `https://twitter.com/${this.runtime.getSetting("TWITTER_USERNAME")}/status/${tweetResult.rest_id}`,
-                    hashtags: [],
-                    mentions: [],
-                    photos: [],
-                    thread: [],
-                    urls: [],
-                    videos: [],
-                } as Tweet;
+        // Combine the timeline tweets and mentions/interactions
+        const allTweets = [...timeline, ...mentionsAndInteractions.tweets];
 
-                await this.runtime.cacheManager.set(
-                    "twitter/" +
-                        this.runtime.getSetting("TWITTER_USERNAME") +
-                        "/lastPost",
-                    {
-                        id: tweet.id,
-                        timestamp: Date.now(),
-                    }
-                );
+        // Create a Set to store unique tweet IDs
+        const tweetIdsToCheck = new Set<string>();
+        const roomIds = new Set<UUID>();
 
-                await this.client.cacheTweet(tweet);
+        // Add tweet IDs to the Set
+        for (const tweet of allTweets) {
+            tweetIdsToCheck.add(tweet.id);
+            roomIds.add(
+                stringToUuid(tweet.conversationId + "-" + this.runtime.agentId)
+            );
+        }
 
-                homeTimeline.push(tweet);
-                await this.client.cacheTimeline(homeTimeline);
-                elizaLogger.log(`Tweet posted:\n ${tweet.permanentUrl}`);
+        // Check the existing memories in the database
+        const existingMemories =
+            await this.runtime.messageManager.getMemoriesByRoomIds({
+                roomIds: Array.from(roomIds),
+            });
 
-                const roomId = stringToUuid(
-                    tweet.conversationId + "-" + this.runtime.agentId
-                );
+        // Create a Set to store the existing memory IDs
+        const existingMemoryIds = new Set<UUID>(
+            existingMemories.map((memory) => memory.id)
+        );
 
-                await this.runtime.ensureRoomExists(roomId);
-                await this.runtime.ensureParticipantInRoom(
+        // Filter out the tweets that already exist in the database
+        const tweetsToSave = allTweets.filter(
+            (tweet) =>
+                !existingMemoryIds.has(
+                    stringToUuid(tweet.id + "-" + this.runtime.agentId)
+                )
+        );
+
+        elizaLogger.debug({
+            processingTweets: tweetsToSave.map((tweet) => tweet.id).join(","),
+        });
+
+        await this.runtime.ensureUserExists(
+            this.runtime.agentId,
+            this.profile.username,
+            this.runtime.character.name,
+            "twitter"
+        );
+
+        // Save the new tweets as memories
+        for (const tweet of tweetsToSave) {
+            elizaLogger.log("Saving Tweet", tweet.id);
+
+            const roomId = stringToUuid(
+                tweet.conversationId + "-" + this.runtime.agentId
+            );
+            const userId =
+                tweet.userId === this.profile.id
+                    ? this.runtime.agentId
+                    : stringToUuid(tweet.userId);
+
+            if (tweet.userId === this.profile.id) {
+                await this.runtime.ensureConnection(
                     this.runtime.agentId,
-                    roomId
-                );
-
-                await this.client.cacheTweet(tweet);
-
-                await this.runtime.messageManager.createMemory({
-                    id: stringToUuid(tweet.id + "-" + this.runtime.agentId),
-                    userId: this.runtime.agentId,
-                    agentId: this.runtime.agentId,
-                    content: {
-                        text: newTweetContent.trim(),
-                        url: tweet.permanentUrl,
-                        source: "twitter",
-                    },
                     roomId,
-                    embedding: embeddingZeroVector,
-                    createdAt: tweet.timestamp * 1000,
-                });
-            } catch (error) {
-                elizaLogger.error("Error sending tweet:", error);
+                    this.profile.username,
+                    this.profile.screenName,
+                    "twitter"
+                );
+            } else {
+                await this.runtime.ensureConnection(
+                    userId,
+                    roomId,
+                    tweet.username,
+                    tweet.name,
+                    "twitter"
+                );
             }
+
+            const content = {
+                text: tweet.text,
+                url: tweet.permanentUrl,
+                source: "twitter",
+                inReplyTo: tweet.inReplyToStatusId
+                    ? stringToUuid(tweet.inReplyToStatusId)
+                    : undefined,
+            } as Content;
+
+            await this.runtime.messageManager.createMemory({
+                id: stringToUuid(tweet.id + "-" + this.runtime.agentId),
+                userId,
+                content: content,
+                agentId: this.runtime.agentId,
+                roomId,
+                embedding: embeddingZeroVector,
+                createdAt: tweet.timestamp * 1000,
+            });
+
+            await this.cacheTweet(tweet);
+        }
+
+        // Cache
+        await this.cacheTimeline(timeline);
+        await this.cacheMentions(mentionsAndInteractions.tweets);
+    }
+
+    async setCookiesFromArray(cookiesArray: any[]) {
+        const cookieStrings = cookiesArray.map(
+            (cookie) =>
+                `${cookie.key}=${cookie.value}; Domain=${cookie.domain}; Path=${cookie.path}; ${
+                    cookie.secure ? "Secure" : ""
+                }; ${cookie.httpOnly ? "HttpOnly" : ""}; SameSite=${
+                    cookie.sameSite || "Lax"
+                }`
+        );
+        await this.twitterClient.setCookies(cookieStrings);
+    }
+
+    async saveRequestMessage(message: Memory, state: State) {
+        if (message.content.text) {
+            const recentMessage = await this.runtime.messageManager.getMemories(
+                {
+                    roomId: message.roomId,
+                    count: 1,
+                    unique: false,
+                }
+            );
+
+            if (
+                recentMessage.length > 0 &&
+                recentMessage[0].content === message.content
+            ) {
+                elizaLogger.debug("Message already saved", recentMessage[0].id);
+            } else {
+                await this.runtime.messageManager.createMemory({
+                    ...message,
+                    embedding: embeddingZeroVector,
+                });
+            }
+
+            await this.runtime.evaluate(message, {
+                ...state,
+                twitterClient: this.twitterClient,
+            });
+        }
+    }
+
+    async loadLatestCheckedTweetId(): Promise<void> {
+        const latestCheckedTweetId =
+            await this.runtime.cacheManager.get<string>(
+                `twitter/${this.profile.username}/latest_checked_tweet_id`
+            );
+
+        if (latestCheckedTweetId) {
+            this.lastCheckedTweetId = BigInt(latestCheckedTweetId);
+        }
+    }
+
+    async cacheLatestCheckedTweetId() {
+        if (this.lastCheckedTweetId) {
+            await this.runtime.cacheManager.set(
+                `twitter/${this.profile.username}/latest_checked_tweet_id`,
+                this.lastCheckedTweetId.toString()
+            );
+        }
+    }
+
+    async getCachedTimeline(): Promise<Tweet[] | undefined> {
+        return await this.runtime.cacheManager.get<Tweet[]>(
+            `twitter/${this.profile.username}/timeline`
+        );
+    }
+
+    async cacheTimeline(timeline: Tweet[]) {
+        await this.runtime.cacheManager.set(
+            `twitter/${this.profile.username}/timeline`,
+            timeline,
+            { expires: 10 * 1000 }
+        );
+    }
+
+    async cacheMentions(mentions: Tweet[]) {
+        await this.runtime.cacheManager.set(
+            `twitter/${this.profile.username}/mentions`,
+            mentions,
+            { expires: 10 * 1000 }
+        );
+    }
+
+    async getCachedCookies(username: string) {
+        return await this.runtime.cacheManager.get<any[]>(
+            `twitter/${username}/cookies`
+        );
+    }
+
+    async cacheCookies(username: string, cookies: any[]) {
+        await this.runtime.cacheManager.set(
+            `twitter/${username}/cookies`,
+            cookies
+        );
+    }
+
+    async getCachedProfile(username: string) {
+        return await this.runtime.cacheManager.get<TwitterProfile>(
+            `twitter/${username}/profile`
+        );
+    }
+
+    async cacheProfile(profile: TwitterProfile) {
+        await this.runtime.cacheManager.set(
+            `twitter/${profile.username}/profile`,
+            profile
+        );
+    }
+
+    async fetchProfile(username: string): Promise<TwitterProfile> {
+        const cached = await this.getCachedProfile(username);
+
+        if (cached) return cached;
+
+        try {
+            const profile = await this.requestQueue.add(async () => {
+                const profile = await this.twitterClient.getProfile(username);
+                // console.log({ profile });
+                return {
+                    id: profile.userId,
+                    username,
+                    screenName: profile.name || this.runtime.character.name,
+                    bio:
+                        profile.biography ||
+                        typeof this.runtime.character.bio === "string"
+                            ? (this.runtime.character.bio as string)
+                            : this.runtime.character.bio.length > 0
+                              ? this.runtime.character.bio[0]
+                              : "",
+                    nicknames:
+                        this.runtime.character.twitterProfile?.nicknames || [],
+                } satisfies TwitterProfile;
+            });
+
+            this.cacheProfile(profile);
+
+            return profile;
         } catch (error) {
-            elizaLogger.error("Error generating new tweet:", error);
+            console.error("Error fetching Twitter profile:", error);
+
+            return undefined;
         }
     }
 }
